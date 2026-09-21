@@ -13,7 +13,66 @@ const STORAGE_TYPE =
     | 'redis'
     | 'upstash'
     | 'kvrocks'
+    | 'sqlite'
     | undefined) || 'localstorage';
+
+// 登录暴力破解限流：同一 IP 在时间窗口内密码错误次数超限则直接拒绝，
+// 不等数据库/密码比较，避免 IP 被无限次尝试穷举密码。
+const LOGIN_RATE_LIMIT = 5;
+const LOGIN_RATE_WINDOW_MS = 30 * 60 * 1000; // 30 分钟
+
+function getClientIP(request: NextRequest): string {
+  const forwardedFor = request.headers.get('x-forwarded-for');
+  if (forwardedFor) {
+    return forwardedFor.split(',')[0].trim();
+  }
+  return (
+    request.headers.get('x-real-ip') ||
+    request.headers.get('cf-connecting-ip') ||
+    'unknown'
+  );
+}
+
+async function isLoginRateLimited(ip: string): Promise<boolean> {
+  // localstorage 模式没有持久化存储（db.storage 为 null），限流无处记录，直接跳过
+  if (STORAGE_TYPE === 'localstorage') return false;
+
+  const key = `login-rate-limit:${ip}`;
+  try {
+    const currentCount = (await db.getCache(key)) || 0;
+    return currentCount >= LOGIN_RATE_LIMIT;
+  } catch (error) {
+    console.error('登录限流检查失败:', error);
+    // 数据库故障时不能因此锁死正常登录，fail-open
+    return false;
+  }
+}
+
+async function recordLoginFailure(ip: string): Promise<void> {
+  if (STORAGE_TYPE === 'localstorage') return;
+
+  const key = `login-rate-limit:${ip}`;
+  try {
+    const currentCount = (await db.getCache(key)) || 0;
+    await db.setCache(key, currentCount + 1, Math.ceil(LOGIN_RATE_WINDOW_MS / 1000));
+  } catch (error) {
+    console.error('登录失败计数写入失败:', error);
+  }
+}
+
+// 判断当前请求是否走 HTTPS，用于决定 Cookie 的 Secure 属性
+// 仅在确定为 https 时才置为 true，http 部署保持原有行为，避免 Cookie 被浏览器丢弃
+function isHttpsRequest(req: NextRequest): boolean {
+  const forwardedProto = req.headers
+    .get('x-forwarded-proto')
+    ?.split(',')[0]
+    .trim()
+    .toLowerCase();
+  if (forwardedProto) {
+    return forwardedProto === 'https';
+  }
+  return req.nextUrl.protocol === 'https:';
+}
 
 // 生成签名
 async function generateSignature(
@@ -69,6 +128,15 @@ async function generateAuthCookie(
 }
 
 export async function POST(req: NextRequest) {
+  const useSecureCookie = isHttpsRequest(req);
+  const clientIP = getClientIP(req);
+  if (await isLoginRateLimited(clientIP)) {
+    return NextResponse.json(
+      { error: '登录尝试次数过多，请 30 分钟后再试' },
+      { status: 429 }
+    );
+  }
+
   try {
     // 本地 / localStorage 模式——仅校验固定密码
     if (STORAGE_TYPE === 'localstorage') {
@@ -84,7 +152,7 @@ export async function POST(req: NextRequest) {
           expires: new Date(0),
           sameSite: 'lax', // 改为 lax 以支持 PWA
           httpOnly: false, // PWA 需要客户端可访问
-          secure: false, // 根据协议自动设置
+          secure: useSecureCookie, // 仅 HTTPS 下启用 Secure
         });
 
         return response;
@@ -96,6 +164,7 @@ export async function POST(req: NextRequest) {
       }
 
       if (password !== envPassword) {
+        await recordLoginFailure(clientIP);
         return NextResponse.json(
           { ok: false, error: '密码错误' },
           { status: 401 }
@@ -160,6 +229,7 @@ export async function POST(req: NextRequest) {
 
       return response;
     } else if (username === process.env.USERNAME) {
+      await recordLoginFailure(clientIP);
       return NextResponse.json({ error: '用户名或密码错误' }, { status: 401 });
     }
 
@@ -174,6 +244,7 @@ export async function POST(req: NextRequest) {
       const pass = await db.verifyUser(username, password);
 
       if (!pass) {
+        await recordLoginFailure(clientIP);
         return NextResponse.json(
           { error: '用户名或密码错误' },
           { status: 401 }
